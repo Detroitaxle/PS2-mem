@@ -1,0 +1,3 @@
+PySide6>=6.5.0
+mymcplusplus>=0.1.0
+

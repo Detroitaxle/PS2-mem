@@ -123,6 +123,9 @@ class CardPane(QWidget):
             return
         
         try:
+            # Reload file from disk in case it was modified externally (e.g., by PS2)
+            self.parser.reload_file()
+            
             self.save_list.clear()
             self.status_label.setText("Loading saves...")
             
@@ -441,6 +444,7 @@ class CardPane(QWidget):
         if reply == QMessageBox.Yes:
             if self.parser.format_card():
                 self.refresh_saves()
+                self.save_btn.setEnabled(False)  # Already saved by format_card
                 self.log_message.emit(f"Formatted memory card {self.pane_number}", "info")
                 QMessageBox.information(self, "Success", "Memory card formatted successfully")
             else:

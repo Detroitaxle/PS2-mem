@@ -5,6 +5,7 @@ Handles reading and writing PS2 memory card files (.ps2, .bin formats)
 
 import struct
 import os
+import zlib
 from datetime import datetime
 from typing import List, Optional, Dict, Callable
 from dataclasses import dataclass
@@ -45,6 +46,13 @@ class PS2CardParser:
         """Load memory card file into memory"""
         with open(self.file_path, 'rb') as f:
             self._data = bytearray(f.read())
+        # Update file size in case it changed
+        self.file_size = len(self._data)
+    
+    def reload_file(self):
+        """Reload the file from disk (useful after external modifications)"""
+        self._load_file()
+        self.modified = False
     
     def _get_card_size(self) -> int:
         """Determine card size based on file size"""
@@ -168,10 +176,18 @@ class PS2CardParser:
                     # Extract product code from directory name (format: BASLUS-21442)
                     product_code = dir_name[:11] if len(dir_name) >= 11 else dir_name
                     
-                    # Convert timestamp
+                    # Convert timestamp (PS2 uses Unix timestamps)
+                    # Handle invalid/zero timestamps gracefully
                     try:
-                        last_modified = datetime.fromtimestamp(entry['created'])
-                    except:
+                        timestamp = entry['created']
+                        # Check if timestamp is reasonable (between 2000 and 2100)
+                        if timestamp > 946684800 and timestamp < 4102444800:  # Jan 1, 2000 to Jan 1, 2100
+                            last_modified = datetime.fromtimestamp(timestamp)
+                        else:
+                            # Invalid timestamp, use current time
+                            last_modified = datetime.now()
+                    except (ValueError, OSError):
+                        # Invalid timestamp format, use current time
                         last_modified = datetime.now()
                     
                     save = PS2Save(
@@ -271,6 +287,30 @@ class PS2CardParser:
             print(f"Export error: {e}")
             return False
     
+    def _get_raw_directory_entry(self, directory_name: str) -> Optional[bytes]:
+        """Get the raw directory entry bytes for a save by directory name"""
+        dir_offset = self._get_directory_offset()
+        
+        for i in range(64):
+            entry_offset = dir_offset + (i * self.DIRECTORY_ENTRY_SIZE)
+            if entry_offset + self.DIRECTORY_ENTRY_SIZE > len(self._data):
+                continue
+            
+            entry_data = self._data[entry_offset:entry_offset + self.DIRECTORY_ENTRY_SIZE]
+            
+            # Check if entry is valid
+            if entry_data[0] == 0x00 or entry_data[0] == 0x51:
+                continue
+            
+            # Extract directory name
+            dir_name = entry_data[0:16].split(b'\x00')[0].decode('ascii', errors='ignore')
+            
+            if dir_name == directory_name:
+                # Return a copy of the entry
+                return bytearray(entry_data)
+        
+        return None
+    
     def copy_save_to(self, destination_parser: 'PS2CardParser', source_save: PS2Save,
                      progress_callback: Optional[Callable[[float, str], bool]] = None) -> bool:
         """
@@ -313,9 +353,10 @@ class PS2CardParser:
                 if not progress_callback(0.4, "Copying directory entry..."):
                     return False
             
-            # Copy directory entry
+            # Copy directory entry - use raw entry to preserve original timestamp
             total_size = sum(len(cluster) for cluster in save_data)
-            if not destination_parser._copy_directory_entry(source_save, free_cluster, total_size):
+            raw_entry = self._get_raw_directory_entry(source_save.directory_name)
+            if not destination_parser._copy_directory_entry(source_save, free_cluster, total_size, raw_entry):
                 if progress_callback:
                     progress_callback(1.0, "Error: Failed to create directory entry")
                 return False
@@ -385,6 +426,7 @@ class PS2CardParser:
         
         # Validate starting cluster
         if start_cluster < 2 or start_cluster >= 0xFF00:
+            print(f"Invalid starting cluster: {start_cluster}")
             return clusters
         
         iteration = 0
@@ -408,12 +450,21 @@ class PS2CardParser:
                 
                 fat_entry = self._read_fat_entry(current_cluster)
                 if fat_entry >= 0xFF00:
+                    # End of chain marker found
+                    break
+                if fat_entry == 0x0000:
+                    # Free cluster - chain is broken
+                    print(f"Warning: Cluster chain broken at cluster {current_cluster} (FAT entry is 0x0000)")
                     break
                 current_cluster = fat_entry
                 iteration += 1
             except (IndexError, struct.error, ValueError) as e:
                 # Stop reading on error
+                print(f"Error reading cluster {current_cluster}: {e}")
                 break
+        
+        if len(clusters) == 0:
+            print(f"Warning: No clusters read for save starting at cluster {start_cluster}")
         
         return clusters
     
@@ -446,8 +497,15 @@ class PS2CardParser:
         except Exception as e:
             raise ValueError(f"Failed to write cluster {cluster}: {str(e)}")
     
-    def _copy_directory_entry(self, source_save: PS2Save, target_cluster: int, size: int) -> bool:
-        """Copy directory entry to destination card"""
+    def _copy_directory_entry(self, source_save: PS2Save, target_cluster: int, size: int, raw_entry: Optional[bytes] = None) -> bool:
+        """Copy directory entry to destination card
+        
+        Args:
+            source_save: Source save to copy
+            target_cluster: Target cluster number on destination
+            size: Size of the save data
+            raw_entry: Optional raw directory entry bytes to preserve original data (timestamp, etc.)
+        """
         try:
             # Find free directory entry slot
             dir_offset = self._get_directory_offset()
@@ -465,34 +523,44 @@ class PS2CardParser:
                 # Check if entry is free
                 if entry_data[0] == 0x00 or entry_data[0] == 0x51:
                     # Create new directory entry
-                    new_entry = bytearray(self.DIRECTORY_ENTRY_SIZE)
-                    
-                    # Directory name (handle encoding errors)
-                    try:
-                        dir_name_bytes = source_save.directory_name.encode('ascii', errors='ignore')[:16].ljust(16, b'\x00')
-                    except:
-                        dir_name_bytes = source_save.directory_name[:16].encode('latin-1', errors='ignore')[:16].ljust(16, b'\x00')
-                    
-                    new_entry[0:16] = dir_name_bytes
-                    
-                    # Mode (directory)
-                    new_entry[2:4] = struct.pack('<H', 0x8427)
-                    
-                    # Length
-                    new_entry[4:8] = struct.pack('<I', size)
-                    
-                    # Created timestamp
-                    try:
-                        timestamp = int(source_save.last_modified.timestamp())
-                    except:
-                        timestamp = int(datetime.now().timestamp())
-                    new_entry[8:12] = struct.pack('<I', timestamp)
-                    
-                    # Cluster
-                    new_entry[20:22] = struct.pack('<H', target_cluster)
-                    
-                    # Directory index
-                    new_entry[22:24] = struct.pack('<H', i)
+                    if raw_entry:
+                        # Use raw entry to preserve original timestamp and other fields
+                        new_entry = bytearray(raw_entry)
+                        # Only update cluster and directory index
+                        new_entry[20:22] = struct.pack('<H', target_cluster)
+                        new_entry[22:24] = struct.pack('<H', i)
+                        # Update size to match actual copied data
+                        new_entry[4:8] = struct.pack('<I', size)
+                    else:
+                        # Create new entry from scratch
+                        new_entry = bytearray(self.DIRECTORY_ENTRY_SIZE)
+                        
+                        # Directory name (handle encoding errors)
+                        try:
+                            dir_name_bytes = source_save.directory_name.encode('ascii', errors='ignore')[:16].ljust(16, b'\x00')
+                        except:
+                            dir_name_bytes = source_save.directory_name[:16].encode('latin-1', errors='ignore')[:16].ljust(16, b'\x00')
+                        
+                        new_entry[0:16] = dir_name_bytes
+                        
+                        # Mode (directory)
+                        new_entry[2:4] = struct.pack('<H', 0x8427)
+                        
+                        # Length
+                        new_entry[4:8] = struct.pack('<I', size)
+                        
+                        # Created timestamp
+                        try:
+                            timestamp = int(source_save.last_modified.timestamp())
+                        except:
+                            timestamp = int(datetime.now().timestamp())
+                        new_entry[8:12] = struct.pack('<I', timestamp)
+                        
+                        # Cluster
+                        new_entry[20:22] = struct.pack('<H', target_cluster)
+                        
+                        # Directory index
+                        new_entry[22:24] = struct.pack('<H', i)
                     
                     self._data[entry_offset:entry_offset + self.DIRECTORY_ENTRY_SIZE] = new_entry
                     self.modified = True
@@ -539,10 +607,22 @@ class PS2CardParser:
             # Initialize with zeros
             data[:] = b'\x00' * card_size
             
-            # Write header (first 512 bytes)
-            # Magic number "Sony PS2 Memory Card Format "
+            # Write header (first 512 bytes - Block 0)
+            # Magic number "Sony PS2 Memory Card Format " (28 bytes)
             header = b'Sony PS2 Memory Card Format '
             data[0:28] = header.ljust(28, b'\x00')
+            
+            # Format version (offset 0x1C-0x1D): 0x0001 for standard format
+            data[0x1C:0x1E] = struct.pack('<H', 0x0001)
+            
+            # Card size in MB (offset 0x1E-0x1F): 0x0008, 0x0010, or 0x0020
+            size_code = {8: 0x0008, 16: 0x0010, 32: 0x0020}.get(size_mb, 0x0008)
+            data[0x1E:0x20] = struct.pack('<H', size_code)
+            
+            # Calculate and write checksum (offset 0x1FC-0x1FF)
+            # Checksum is CRC32 of first 0x1FC bytes (508 bytes)
+            checksum = zlib.crc32(data[0:0x1FC]) & 0xFFFFFFFF
+            data[0x1FC:0x200] = struct.pack('<I', checksum)
             
             # Write FAT table
             fat_offset = 512 * 2  # FAT starts at block 2
@@ -583,9 +663,23 @@ class PS2CardParser:
             self._data = bytearray(card_size)
             self._data[:] = b'\x00' * card_size
             
-            # Write header
+            # Write header (first 512 bytes - Block 0)
+            # Magic number "Sony PS2 Memory Card Format " (28 bytes)
             header = b'Sony PS2 Memory Card Format '
             self._data[0:28] = header.ljust(28, b'\x00')
+            
+            # Format version (offset 0x1C-0x1D): 0x0001 for standard format
+            self._data[0x1C:0x1E] = struct.pack('<H', 0x0001)
+            
+            # Card size in MB (offset 0x1E-0x1F): 0x0008, 0x0010, or 0x0020
+            size_mb = card_size // (1024 * 1024)
+            size_code = {8: 0x0008, 16: 0x0010, 32: 0x0020}.get(size_mb, 0x0008)
+            self._data[0x1E:0x20] = struct.pack('<H', size_code)
+            
+            # Calculate and write checksum (offset 0x1FC-0x1FF)
+            # Checksum is CRC32 of first 0x1FC bytes (508 bytes)
+            checksum = zlib.crc32(self._data[0:0x1FC]) & 0xFFFFFFFF
+            self._data[0x1FC:0x200] = struct.pack('<I', checksum)
             
             # Reset FAT table
             fat_offset = self._get_fat_offset()
@@ -603,7 +697,11 @@ class PS2CardParser:
             
             # Directory is already zeroed
             
+            # Auto-save after formatting
             self.modified = True
+            if not self.save():
+                return False
+            
             return True
         except Exception as e:
             print(f"Error formatting card: {e}")
